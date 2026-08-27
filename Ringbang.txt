@@ -1,0 +1,1346 @@
+-- =============================================
+-- Diogo Br BOT System - Versión Limpia
+-- SIN LISTA DE BOTS
+-- =============================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- =============================================
+-- CONFIGURACIÓN
+-- =============================================
+
+local Config = {
+    -- Configuración del Ring
+    RingPos = Vector3.new(-1896, 33.5, -70),
+    RingSize = Vector3.new(68, 26, 115),
+    RingColor = Color3.fromRGB(255, 0, 0),
+    RingTransparency = 1,
+    
+    -- Configuración de Persecución
+    ChaseHeight = 35,
+    ChaseSpeed = 500,
+    
+    -- Configuración de Kill Aura
+    HorizontalRange = 100,
+    VerticalRange = 150,
+    
+    -- Configuración de Invisibilidad
+    FakeInvisOffset = 6000,
+}
+
+-- =============================================
+-- VARIABLES GLOBALES
+-- =============================================
+
+local ESP_Enabled = false
+local Carnage_Enabled = false
+local AntiRagdoll_Active = false
+local FakeInvis_Active = false
+local TargetPlayer = nil
+local TargetName = ""
+local LastAttackTime = 0
+local AttackCooldown = 1/1000
+
+local ESP_Folder = nil
+local ESP_Objects = {}
+local CarnageConnection = nil
+local AntiRagdollConnection = nil
+local ChaseConnection = nil
+local CarnageLoopThread = nil
+local PlayerAddedConnection = nil
+local PlayerRemovingConnection = nil
+
+local RingMin = Config.RingPos - Config.RingSize / 2
+local RingMax = Config.RingPos + Config.RingSize / 2
+
+local HitRemote = nil
+
+-- =============================================
+-- FUNCIONES DE UTILIDAD
+-- =============================================
+
+-- Obtener el servicio de combate
+local function GetCombatService()
+    if HitRemote then return HitRemote end
+    
+    local success, result = pcall(function()
+        local Packages = ReplicatedStorage:WaitForChild("Packages")
+        local Knit = Packages:WaitForChild("Knit")
+        local Services = Knit:WaitForChild("Services")
+        local CombatService = Services:WaitForChild("CombatService")
+        local RF = CombatService:WaitForChild("RF")
+        return RF:WaitForChild("Hit")
+    end)
+    
+    if success then
+        HitRemote = result
+        return HitRemote
+    end
+    
+    return nil
+end
+
+-- Verificar si un jugador está dentro del ring
+local function IsInRing(player)
+    if not player or not player.Character then return false end
+    
+    local rootPart = player.Character:FindFirstChild("HumanoidRootPart")
+    if not rootPart then return false end
+    
+    local pos = rootPart.Position
+    return pos.X >= RingMin.X and pos.X <= RingMax.X and
+           pos.Y >= RingMin.Y and pos.Y <= RingMax.Y and
+           pos.Z >= RingMin.Z and pos.Z <= RingMax.Z
+end
+
+-- Verificar si un jugador está vivo
+local function IsAlive(player)
+    if not player or not player.Character then return false end
+    
+    local humanoid = player.Character:FindFirstChild("Humanoid")
+    local rootPart = player.Character:FindFirstChild("HumanoidRootPart")
+    
+    if not humanoid or not rootPart then return false end
+    if humanoid.Health <= 0 then return false end
+    
+    return true
+end
+
+-- =============================================
+-- ANTI-RAGDOLL
+-- =============================================
+
+-- Guardar los motores del personaje
+local function SaveMotors(character)
+    if not character then return nil end
+    
+    local motors = {}
+    local descendants = character:GetDescendants()
+    
+    for _, obj in ipairs(descendants) do
+        if obj:IsA("Motor6D") then
+            motors[obj.Name] = {
+                Part0 = obj.Part0,
+                Part1 = obj.Part1,
+                C0 = obj.C0,
+                C1 = obj.C1
+            }
+        end
+    end
+    
+    return motors
+end
+
+-- Restaurar los motores del personaje
+local function RestoreMotors(motors)
+    if not motors then return end
+    
+    for name, data in pairs(motors) do
+        if data.Part0 and data.Part0.Parent then
+            if data.Part0:FindFirstChild(name) == nil then
+                local motor = Instance.new("Motor6D")
+                motor.Name = name
+                motor.Part0 = data.Part0
+                motor.Part1 = data.Part1
+                motor.C0 = data.C0
+                motor.C1 = data.C1
+                motor.Parent = data.Part0
+            end
+        end
+    end
+end
+
+-- Verificar si el personaje está en estado de ragdoll
+local function IsRagdolled(humanoid)
+    if not humanoid then return false end
+    
+    local state = humanoid:GetState()
+    return state == Enum.HumanoidStateType.Physics or
+           state == Enum.HumanoidStateType.FallingDown or
+           humanoid.PlatformStand or
+           state == Enum.HumanoidStateType.Running
+end
+
+-- Anti-ragdoll permanente
+local function FixRagdoll()
+    if not AntiRagdoll_Active then return end
+    
+    local character = LocalPlayer.Character
+    if not character then return end
+    
+    local humanoid = character:FindFirstChild("Humanoid")
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    
+    if not humanoid or not rootPart then return end
+    
+    if IsRagdolled(humanoid) then
+        local motors = SaveMotors(character)
+        
+        humanoid:ChangeState(Enum.HumanoidStateType.Running)
+        humanoid.PlatformStand = false
+        humanoid.Sit = false
+        humanoid.AutoRotate = true
+        
+        rootPart.Velocity = Vector3.new(rootPart.Velocity.X, 20, rootPart.Velocity.Z)
+        
+        RestoreMotors(motors)
+        
+        print("🛡️ Anti-ragdoll activado - levantando personaje")
+    end
+end
+
+-- Iniciar Anti-ragdoll
+local function StartAntiRagdoll()
+    AntiRagdoll_Active = true
+    
+    if AntiRagdollConnection then
+        AntiRagdollConnection:Disconnect()
+    end
+    
+    AntiRagdollConnection = RunService.Heartbeat:Connect(FixRagdoll)
+    print("🛡️ Anti-ragdoll permanente activado")
+end
+
+-- =============================================
+-- ESP (Wallhack)
+-- =============================================
+
+local function CreateESPForPlayer(player)
+    if not player or player == LocalPlayer then return end
+    if not ESP_Enabled then return end
+    
+    -- Crear folder para el ESP
+    if not ESP_Folder or not ESP_Folder.Parent then
+        ESP_Folder = Instance.new("Folder")
+        ESP_Folder.Name = "ESP_" .. tostring(tick())
+        ESP_Folder.Parent = game:GetService("CoreGui")
+    end
+    
+    -- Eliminar ESP existente
+    local existing = ESP_Folder:FindFirstChild(player.Name)
+    if existing then
+        existing:ClearAllChildren()
+        existing:Destroy()
+    end
+    
+    local playerFolder = Instance.new("Folder")
+    playerFolder.Name = player.Name
+    playerFolder.Parent = ESP_Folder
+    
+    ESP_Objects[player] = {}
+    
+    local function CreateESPForCharacter(character)
+        if not character or not ESP_Enabled then return end
+        
+        task.spawn(function()
+            local rootPart = character:WaitForChild("HumanoidRootPart", 2)
+            if not rootPart then return end
+            
+            -- Caja alrededor del jugador
+            local box = Instance.new("BoxHandleAdornment")
+            box.Name = "Box"
+            box.Size = Vector3.new(4, 7, 4)
+            box.Transparency = 0.7
+            box.ZIndex = 0
+            box.AlwaysOnTop = true
+            box.Visible = true
+            box.Adornee = rootPart
+            box.Parent = playerFolder
+            
+            -- Nombre del jugador
+            local billboard = Instance.new("BillboardGui")
+            billboard.Name = "NameTag"
+            billboard.Enabled = true
+            billboard.Size = UDim2.new(0, 200, 0, 50)
+            billboard.AlwaysOnTop = true
+            billboard.StudsOffset = Vector3.new(0, 5, 0)
+            billboard.MaxDistance = 1000
+            billboard.Adornee = rootPart
+            billboard.Parent = playerFolder
+            
+            local nameLabel = Instance.new("TextLabel")
+            nameLabel.Parent = billboard
+            nameLabel.Name = "Tag"
+            nameLabel.BackgroundTransparency = 1
+            nameLabel.Position = UDim2.new(0, -50, 0, 0)
+            nameLabel.Size = UDim2.new(0, 300, 0, 20)
+            nameLabel.TextSize = 22
+            nameLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+            nameLabel.TextStrokeTransparency = 0.4
+            nameLabel.Text = player.Name
+            nameLabel.Font = Enum.Font.SourceSansBold
+            nameLabel.TextScaled = false
+            
+            -- Highlight
+            local highlight = Instance.new("Highlight")
+            highlight.Name = "Highlight"
+            highlight.Adornee = character
+            highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            highlight.FillTransparency = 0.5
+            highlight.OutlineTransparency = 0
+            highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+            highlight.Parent = playerFolder
+            
+            -- Colores según equipo
+            local color = player.TeamColor and player.TeamColor.Color or Color3.fromRGB(255, 255, 255)
+            box.Color3 = color
+            nameLabel.TextColor3 = color
+            highlight.FillColor = color
+        end)
+    end
+    
+    -- Crear ESP para el personaje actual
+    if player.Character then
+        CreateESPForCharacter(player.Character)
+    end
+    
+    -- Conectar a CharacterAdded
+    local connection = player.CharacterAdded:Connect(function(character)
+        task.wait(0.5)
+        if ESP_Enabled and playerFolder.Parent then
+            CreateESPForCharacter(character)
+        end
+    end)
+    
+    ESP_Objects[player].charConnection = connection
+    ESP_Objects[player].folder = playerFolder
+end
+
+local function RemoveESPForPlayer(player)
+    local data = ESP_Objects[player]
+    if data then
+        if data.charConnection then
+            data.charConnection:Disconnect()
+        end
+        ESP_Objects[player] = nil
+    end
+    
+    if ESP_Folder and ESP_Folder.Parent then
+        local folder = ESP_Folder:FindFirstChild(player.Name)
+        if folder then
+            folder:ClearAllChildren()
+            folder:Destroy()
+        end
+    end
+end
+
+local function ToggleESP()
+    ESP_Enabled = not ESP_Enabled
+    
+    if ESP_Enabled then
+        print("🔍 Activando ESP...")
+        
+        if ESP_Folder and ESP_Folder.Parent then
+            ESP_Folder:Destroy()
+        end
+        
+        ESP_Folder = Instance.new("Folder")
+        ESP_Folder.Name = "ESP_" .. tostring(tick())
+        ESP_Folder.Parent = game:GetService("CoreGui")
+        
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                CreateESPForPlayer(player)
+            end
+        end
+        
+        if PlayerAddedConnection then
+            PlayerAddedConnection:Disconnect()
+        end
+        
+        PlayerAddedConnection = Players.PlayerAdded:Connect(function(player)
+            if player ~= LocalPlayer then
+                CreateESPForPlayer(player)
+            end
+        end)
+        
+        if PlayerRemovingConnection then
+            PlayerRemovingConnection:Disconnect()
+        end
+        
+        PlayerRemovingConnection = Players.PlayerRemoving:Connect(function(player)
+            RemoveESPForPlayer(player)
+        end)
+        
+        print("✅ ESP Activado")
+    else
+        print("🔍 Desactivando ESP...")
+        
+        if PlayerAddedConnection then
+            PlayerAddedConnection:Disconnect()
+            PlayerAddedConnection = nil
+        end
+        
+        if PlayerRemovingConnection then
+            PlayerRemovingConnection:Disconnect()
+            PlayerRemovingConnection = nil
+        end
+        
+        for player, data in pairs(ESP_Objects) do
+            if data.charConnection then
+                data.charConnection:Disconnect()
+            end
+        end
+        ESP_Objects = {}
+        
+        if ESP_Folder then
+            ESP_Folder:ClearAllChildren()
+            ESP_Folder:Destroy()
+            ESP_Folder = nil
+        end
+        
+        print("✅ ESP Desactivado")
+    end
+end
+
+-- =============================================
+-- KILL AURA (CARNAGE)
+-- =============================================
+
+local function StopChase()
+    if ChaseConnection then
+        ChaseConnection:Disconnect()
+        ChaseConnection = nil
+    end
+end
+
+local function StartChase(target)
+    if ChaseConnection then
+        StopChase()
+    end
+    
+    if not target or not IsAlive(target) then return end
+    
+    local function ChaseLoop()
+        if not Carnage_Enabled then
+            StopChase()
+            return
+        end
+        
+        local character = LocalPlayer.Character
+        if not character then
+            StopChase()
+            return
+        end
+        
+        local rootPart = character:FindFirstChild("HumanoidRootPart")
+        if not rootPart then return end
+        
+        local targetChar = target.Character
+        if not targetChar or not IsAlive(target) then
+            StopChase()
+            return
+        end
+        
+        local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
+        if not targetRoot then return end
+        
+        local targetPos = Vector3.new(targetRoot.Position.X, Config.ChaseHeight, targetRoot.Position.Z)
+        
+        local distance = (targetPos - rootPart.Position).Magnitude
+        
+        if distance < 3 then
+            pcall(function()
+                rootPart.CFrame = CFrame.new(targetPos, targetRoot.Position)
+                rootPart.Velocity = Vector3.new(0, 0, 0)
+                rootPart.RotVelocity = Vector3.new(0, 0, 0)
+            end)
+        else
+            local speed = Config.ChaseSpeed
+            local newPos = rootPart.Position + (targetPos - rootPart.Position).Unit * speed * (task.wait() or 0.016)
+            
+            newPos = Vector3.new(
+                math.clamp(newPos.X, RingMin.X, RingMax.X),
+                Config.ChaseHeight,
+                math.clamp(newPos.Z, RingMin.Z, RingMax.Z)
+            )
+            
+            pcall(function()
+                rootPart.CFrame = CFrame.new(newPos, targetRoot.Position)
+                rootPart.Velocity = Vector3.new(0, 0, 0)
+                rootPart.RotVelocity = Vector3.new(0, 0, 0)
+            end)
+        end
+    end
+    
+    ChaseConnection = RunService.Heartbeat:Connect(ChaseLoop)
+end
+
+local function AttackPlayer(target)
+    if not target or not target.Character then return end
+    
+    local character = LocalPlayer.Character
+    if not character then return end
+    
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    local targetRoot = target.Character:FindFirstChild("HumanoidRootPart")
+    
+    if not rootPart or not targetRoot then return end
+    
+    local distance = (rootPart.Position - targetRoot.Position).Magnitude
+    if distance > Config.HorizontalRange then return end
+    
+    local verticalDist = math.abs(rootPart.Position.Y - targetRoot.Position.Y)
+    if verticalDist > Config.VerticalRange then return end
+    
+    local humanoid = target.Character:FindFirstChild("Humanoid")
+    if humanoid and humanoid.Health > 0 then
+        local hitRemote = GetCombatService()
+        if hitRemote then
+            pcall(function()
+                hitRemote:InvokeServer(humanoid, rootPart.Position)
+            end)
+        end
+    end
+end
+
+local function FindNearestEnemy()
+    local character = LocalPlayer.Character
+    if not character then return nil end
+    
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    if not rootPart then return nil end
+    
+    local nearest = nil
+    local nearestDist = math.huge
+    
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and IsAlive(player) then
+            local targetRoot = player.Character:FindFirstChild("HumanoidRootPart")
+            if targetRoot then
+                local dist = (rootPart.Position - targetRoot.Position).Magnitude
+                if dist <= Config.HorizontalRange and dist < nearestDist then
+                    nearest = player
+                    nearestDist = dist
+                end
+            end
+        end
+    end
+    
+    return nearest
+end
+
+local function ToggleCarnage()
+    Carnage_Enabled = not Carnage_Enabled
+    
+    if Carnage_Enabled then
+        print("⚔️ CARNAGE ACTIVADO")
+        
+        local character = LocalPlayer.Character
+        if character then
+            local rootPart = character:FindFirstChild("HumanoidRootPart")
+            if rootPart then
+                pcall(function()
+                    rootPart.CFrame = CFrame.new(Vector3.new(-1896, 24, -70))
+                    rootPart.Velocity = Vector3.new(0, 0, 0)
+                    rootPart.RotVelocity = Vector3.new(0, 0, 0)
+                end)
+            end
+        end
+        
+        if CarnageConnection then
+            CarnageConnection:Disconnect()
+        end
+        
+        CarnageConnection = RunService.Heartbeat:Connect(function()
+            if not Carnage_Enabled then return end
+            
+            local now = tick()
+            if now - LastAttackTime < AttackCooldown then return end
+            
+            local target = TargetPlayer
+            
+            if not target or not IsAlive(target) then
+                target = FindNearestEnemy()
+            end
+            
+            if target and IsAlive(target) then
+                AttackPlayer(target)
+                LastAttackTime = now
+            end
+        end)
+        
+        -- Loop de persecución
+        if CarnageLoopThread then
+            task.cancel(CarnageLoopThread)
+        end
+        
+        CarnageLoopThread = task.spawn(function()
+            while Carnage_Enabled do
+                task.wait(0.1)
+                
+                if TargetPlayer and IsInRing(TargetPlayer) and IsAlive(TargetPlayer) then
+                    StartChase(TargetPlayer)
+                    
+                    if FakeInvis_Active then
+                        ToggleFakeInvis()
+                    end
+                else
+                    StopChase()
+                    
+                    if Carnage_Enabled and not FakeInvis_Active then
+                        ToggleFakeInvis()
+                    end
+                end
+            end
+        end)
+        
+        print("✅ Kill Aura activado - Rango: " .. Config.HorizontalRange .. " studs")
+    else
+        print("⚔️ CARNAGE DESACTIVADO")
+        
+        StopChase()
+        
+        if CarnageConnection then
+            CarnageConnection:Disconnect()
+            CarnageConnection = nil
+        end
+        
+        if CarnageLoopThread then
+            task.cancel(CarnageLoopThread)
+            CarnageLoopThread = nil
+        end
+        
+        if FakeInvis_Active then
+            ToggleFakeInvis()
+        end
+        
+        print("✅ Kill Aura desactivado")
+    end
+end
+
+-- =============================================
+-- FAKE INVISIBILITY
+-- =============================================
+
+local InvisConnections = {}
+local OriginalCFrame = nil
+
+local function CleanupInvisConnections()
+    for _, data in ipairs(InvisConnections) do
+        if data.type == "step" then
+            pcall(function()
+                RunService:UnbindFromRenderStep(data.step)
+            end)
+        elseif data.type == "event" then
+            pcall(function()
+                data.conn:Disconnect()
+            end)
+        end
+    end
+    InvisConnections = {}
+end
+
+local function ToggleFakeInvis()
+    FakeInvis_Active = not FakeInvis_Active
+    
+    if FakeInvis_Active then
+        print("👻 Invisibilidad falsa ACTIVADA")
+        
+        local character = LocalPlayer.Character
+        if not character then
+            print("⚠️ No hay personaje para activar invisibilidad")
+            FakeInvis_Active = false
+            return
+        end
+        
+        local rootPart = character:FindFirstChild("HumanoidRootPart")
+        if not rootPart then
+            print("⚠️ No se encontró HumanoidRootPart")
+            FakeInvis_Active = false
+            return
+        end
+        
+        OriginalCFrame = rootPart.CFrame
+        
+        CleanupInvisConnections()
+        
+        local stepName1 = "FakeStep_" .. tostring(tick()) .. "_" .. math.random(1000, 9999)
+        local stepName2 = "FakeStep_" .. tostring(tick()) .. "_" .. math.random(1000, 9999)
+        
+        RunService:BindToRenderStep(stepName1, Enum.RenderPriority.Camera.Value - 5, function()
+            if rootPart and FakeInvis_Active and rootPart.Parent then
+                rootPart.CFrame = OriginalCFrame
+            end
+        end)
+        table.insert(InvisConnections, {step = stepName1, type = "step"})
+        
+        RunService:BindToRenderStep(stepName2, Enum.RenderPriority.Camera.Value + 5, function()
+            if rootPart and FakeInvis_Active and rootPart.Parent then
+                OriginalCFrame = rootPart.CFrame
+                rootPart.CFrame = CFrame.new(rootPart.Position + Vector3.new(0, -Config.FakeInvisOffset, 0)) * CFrame.Angles(0, 0, math.rad(180))
+            end
+        end)
+        table.insert(InvisConnections, {step = stepName2, type = "step"})
+        
+        local conn1 = RunService.PreAnimation:Connect(function()
+            if rootPart and FakeInvis_Active and rootPart.Parent then
+                rootPart.CFrame = OriginalCFrame
+            end
+        end)
+        table.insert(InvisConnections, {conn = conn1, type = "event"})
+        
+        local conn2 = RunService.PostSimulation:Connect(function()
+            if rootPart and FakeInvis_Active and rootPart.Parent then
+                OriginalCFrame = rootPart.CFrame
+                rootPart.CFrame = CFrame.new(rootPart.Position + Vector3.new(0, -Config.FakeInvisOffset, 0)) * CFrame.Angles(0, 0, math.rad(180))
+            end
+        end)
+        table.insert(InvisConnections, {conn = conn2, type = "event"})
+        
+        print("✅ Invisibilidad activada - 6000 studs abajo")
+    else
+        print("👁️ Invisibilidad falsa DESACTIVADA")
+        
+        CleanupInvisConnections()
+        
+        local character = LocalPlayer.Character
+        if character then
+            local rootPart = character:FindFirstChild("HumanoidRootPart")
+            if rootPart and OriginalCFrame then
+                pcall(function()
+                    rootPart.CFrame = OriginalCFrame
+                end)
+            end
+        end
+        
+        print("✅ Invisibilidad desactivada")
+    end
+end
+
+-- =============================================
+-- SISTEMA DE OBJETIVOS
+-- =============================================
+
+local function FindPlayerByName(name)
+    if name == "" or name:lower() == "todos" or name:lower() == "all" then
+        return nil, "TODOS"
+    end
+    
+    local search = name:lower():gsub("%s+", "")
+    
+    -- Buscar coincidencia exacta
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            if player.Name:lower() == search or player.DisplayName:lower() == search then
+                return player, player.Name
+            end
+        end
+    end
+    
+    -- Buscar por coincidencia parcial (mínimo 3 letras)
+    if #search >= 3 then
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local nameLower = player.Name:lower()
+                local displayLower = player.DisplayName:lower()
+                
+                if nameLower:sub(1, #search) == search or displayLower:sub(1, #search) == search then
+                    return player, player.Name
+                end
+            end
+        end
+        
+        -- Buscar contiene el texto
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local nameLower = player.Name:lower()
+                local displayLower = player.DisplayName:lower()
+                
+                if nameLower:find(search, 1, true) or displayLower:find(search, 1, true) then
+                    return player, player.Name
+                end
+            end
+        end
+    end
+    
+    if #search > 0 and #search < 3 then
+        return false, "Mínimo 3 letras"
+    end
+    
+    return false, "No encontrado"
+end
+
+-- =============================================
+-- CREAR ANILLO DEL RING
+-- =============================================
+
+local function CreateRing()
+    print("⚡ Creando cubo del ring")
+    
+    local ring = Instance.new("Part")
+    ring.Name = "CUBO_INVISIBLE_" .. LocalPlayer.Name
+    ring.Size = Config.RingSize
+    ring.Position = Config.RingPos
+    ring.Anchored = true
+    ring.CanCollide = false
+    ring.Transparency = Config.RingTransparency
+    ring.BrickColor = BrickColor.new(Config.RingColor)
+    ring.Material = Enum.Material.SmoothPlastic
+    ring.Shape = Enum.PartType.Block
+    ring.CastShadow = true
+    ring.Parent = Workspace
+    
+    -- Crear bordes
+    local function CreateEdge(size, position)
+        local edge = Instance.new("Part")
+        edge.Size = size
+        edge.Position = position
+        edge.Anchored = true
+        edge.CanCollide = false
+        edge.Transparency = 0.7
+        edge.BrickColor = BrickColor.new(Config.RingColor)
+        edge.Material = Enum.Material.Neon
+        edge.Parent = ring
+        return edge
+    end
+    
+    local pos = Config.RingPos
+    local size = Config.RingSize
+    
+    -- Bordes horizontales superiores
+    CreateEdge(Vector3.new(size.X, 0.2, 0.2), pos + Vector3.new(0, size.Y/2, size.Z/2))
+    CreateEdge(Vector3.new(size.X, 0.2, 0.2), pos + Vector3.new(0, size.Y/2, -size.Z/2))
+    CreateEdge(Vector3.new(0.2, 0.2, size.Z), pos + Vector3.new(size.X/2, size.Y/2, 0))
+    CreateEdge(Vector3.new(0.2, 0.2, size.Z), pos + Vector3.new(-size.X/2, size.Y/2, 0))
+    
+    -- Bordes horizontales inferiores
+    CreateEdge(Vector3.new(size.X, 0.2, 0.2), pos + Vector3.new(0, -size.Y/2, size.Z/2))
+    CreateEdge(Vector3.new(size.X, 0.2, 0.2), pos + Vector3.new(0, -size.Y/2, -size.Z/2))
+    CreateEdge(Vector3.new(0.2, 0.2, size.Z), pos + Vector3.new(size.X/2, -size.Y/2, 0))
+    CreateEdge(Vector3.new(0.2, 0.2, size.Z), pos + Vector3.new(-size.X/2, -size.Y/2, 0))
+    
+    -- Bordes verticales
+    CreateEdge(Vector3.new(0.2, size.Y, 0.2), pos + Vector3.new(size.X/2, 0, size.Z/2))
+    CreateEdge(Vector3.new(0.2, size.Y, 0.2), pos + Vector3.new(size.X/2, 0, -size.Z/2))
+    CreateEdge(Vector3.new(0.2, size.Y, 0.2), pos + Vector3.new(-size.X/2, 0, size.Z/2))
+    CreateEdge(Vector3.new(0.2, size.Y, 0.2), pos + Vector3.new(-size.X/2, 0, -size.Z/2))
+    
+    print("✅ Cubo del ring creado")
+    return ring
+end
+
+-- =============================================
+-- CREAR GUI COMPLETA
+-- =============================================
+
+local function CreateFullGUI()
+    local screenGui = LocalPlayer.PlayerGui:FindFirstChild("MainFrames") 
+        or Instance.new("ScreenGui")
+    screenGui.Name = "MainFrames"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = LocalPlayer.PlayerGui
+    
+    local width, height = 320, 450
+    
+    local mainFrame = Instance.new("Frame")
+    mainFrame.Size = UDim2.new(0, width, 0, height)
+    mainFrame.Position = UDim2.new(0.5, -width/2, 0.5, -height/2)
+    mainFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+    mainFrame.BorderSizePixel = 0
+    mainFrame.ClipsDescendants = true
+    mainFrame.Parent = screenGui
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 12)
+    corner.Parent = mainFrame
+    
+    local gradient = Instance.new("UIGradient")
+    gradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(30, 30, 30)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(10, 10, 10))
+    })
+    gradient.Rotation = 90
+    gradient.Parent = mainFrame
+    
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(255, 255, 255)
+    stroke.Transparency = 0.4
+    stroke.Thickness = 1.5
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Parent = mainFrame
+    
+    -- Barra de título
+    local titleBar = Instance.new("Frame")
+    titleBar.Size = UDim2.new(1, 0, 0, 40)
+    titleBar.BackgroundTransparency = 1
+    titleBar.Parent = mainFrame
+    
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(0.7, 0, 1, 0)
+    titleLabel.Position = UDim2.new(0, 12, 0, 0)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = "Diogo Br To Bots"
+    titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    titleLabel.TextSize = 20
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Parent = titleBar
+    
+    -- Botón minimizar
+    local minButton = Instance.new("TextButton")
+    minButton.Size = UDim2.new(0, 34, 0, 34)
+    minButton.Position = UDim2.new(1, -80, 0, 3)
+    minButton.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    minButton.Text = "-"
+    minButton.TextColor3 = Color3.fromRGB(200, 200, 200)
+    minButton.Font = Enum.Font.GothamBold
+    minButton.TextSize = 24
+    minButton.Parent = titleBar
+    
+    local minCorner = Instance.new("UICorner")
+    minCorner.CornerRadius = UDim.new(0, 8)
+    minCorner.Parent = minButton
+    
+    -- Botón cerrar
+    local closeButton = Instance.new("TextButton")
+    closeButton.Size = UDim2.new(0, 34, 0, 34)
+    closeButton.Position = UDim2.new(1, -42, 0, 3)
+    closeButton.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+    closeButton.Text = "X"
+    closeButton.TextColor3 = Color3.fromRGB(255, 220, 220)
+    closeButton.Font = Enum.Font.GothamBold
+    closeButton.TextSize = 22
+    closeButton.Parent = titleBar
+    
+    local closeCorner = Instance.new("UICorner")
+    closeCorner.CornerRadius = UDim.new(0, 8)
+    closeCorner.Parent = closeButton
+    
+    -- Contenido
+    local content = Instance.new("Frame")
+    content.Name = "Content"
+    content.Size = UDim2.new(1, 0, 1, -40)
+    content.Position = UDim2.new(0, 0, 0, 40)
+    content.BackgroundTransparency = 1
+    content.Parent = mainFrame
+    
+    -- Funcionalidad minimizar
+    local minimized = false
+    local originalHeight = height
+    
+    minButton.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        if minimized then
+            mainFrame.Size = UDim2.new(0, width, 0, 40)
+            minButton.Text = "+"
+            minButton.TextColor3 = Color3.fromRGB(100, 255, 100)
+            content.Visible = false
+        else
+            mainFrame.Size = UDim2.new(0, width, 0, originalHeight)
+            minButton.Text = "-"
+            minButton.TextColor3 = Color3.fromRGB(200, 200, 200)
+            content.Visible = true
+        end
+    end)
+    
+    -- Cerrar GUI
+    closeButton.MouseButton1Click:Connect(function()
+        if ESP_Enabled then ToggleESP() end
+        if Carnage_Enabled then ToggleCarnage() end
+        if FakeInvis_Active then ToggleFakeInvis() end
+        
+        mainFrame:Destroy()
+    end)
+    
+    -- =============================================
+    -- BOTONES DE LA GUI
+    -- =============================================
+    
+    -- Botón ESP
+    local espButton = Instance.new("TextButton")
+    espButton.Size = UDim2.new(0.4, 0, 0, 40)
+    espButton.Position = UDim2.new(0.075, 0, 0.05, 0)
+    espButton.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    espButton.Text = "ESP: OFF"
+    espButton.TextColor3 = Color3.fromRGB(255, 80, 80)
+    espButton.Font = Enum.Font.GothamBold
+    espButton.TextSize = 16
+    espButton.Parent = content
+    
+    local espCorner = Instance.new("UICorner")
+    espCorner.CornerRadius = UDim.new(0, 10)
+    espCorner.Parent = espButton
+    
+    local espStroke = Instance.new("UIStroke")
+    espStroke.Color = Color3.fromRGB(60, 60, 60)
+    espStroke.Thickness = 1.5
+    espStroke.Parent = espButton
+    
+    -- Botón Carnage
+    local carnageButton = Instance.new("TextButton")
+    carnageButton.Size = UDim2.new(0.4, 0, 0, 40)
+    carnageButton.Position = UDim2.new(0.525, 0, 0.05, 0)
+    carnageButton.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    carnageButton.Text = "CARNAGE: OFF"
+    carnageButton.TextColor3 = Color3.fromRGB(255, 80, 80)
+    carnageButton.Font = Enum.Font.GothamBold
+    carnageButton.TextSize = 16
+    carnageButton.Parent = content
+    
+    local carnageCorner = Instance.new("UICorner")
+    carnageCorner.CornerRadius = UDim.new(0, 10)
+    carnageCorner.Parent = carnageButton
+    
+    local carnageStroke = Instance.new("UIStroke")
+    carnageStroke.Color = Color3.fromRGB(60, 60, 60)
+    carnageStroke.Thickness = 1.5
+    carnageStroke.Parent = carnageButton
+    
+    -- Texto de objetivo
+    local targetLabel = Instance.new("TextLabel")
+    targetLabel.Size = UDim2.new(0.85, 0, 0, 20)
+    targetLabel.Position = UDim2.new(0.075, 0, 0.2, 0)
+    targetLabel.BackgroundTransparency = 1
+    targetLabel.Text = "Objetivo Específico:"
+    targetLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    targetLabel.Font = Enum.Font.Gotham
+    targetLabel.TextSize = 14
+    targetLabel.TextXAlignment = Enum.TextXAlignment.Left
+    targetLabel.Parent = content
+    
+    -- Campo de texto para objetivo
+    local targetBox = Instance.new("TextBox")
+    targetBox.Size = UDim2.new(0.85, 0, 0, 35)
+    targetBox.Position = UDim2.new(0.075, 0, 0.25, 0)
+    targetBox.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+    targetBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    targetBox.Font = Enum.Font.Gotham
+    targetBox.TextSize = 16
+    targetBox.PlaceholderText = "Escribe 3+ letras y presiona Enter"
+    targetBox.Text = ""
+    targetBox.Parent = content
+    
+    local targetBoxCorner = Instance.new("UICorner")
+    targetBoxCorner.CornerRadius = UDim.new(0, 8)
+    targetBoxCorner.Parent = targetBox
+    
+    local targetBoxStroke = Instance.new("UIStroke")
+    targetBoxStroke.Color = Color3.fromRGB(60, 60, 60)
+    targetBoxStroke.Thickness = 1.5
+    targetBoxStroke.Parent = targetBox
+    
+    -- Estado del objetivo
+    local targetStatus = Instance.new("TextLabel")
+    targetStatus.Size = UDim2.new(0.85, 0, 0, 20)
+    targetStatus.Position = UDim2.new(0.075, 0, 0.32, 0)
+    targetStatus.BackgroundTransparency = 1
+    targetStatus.Text = "Objetivo actual: TODOS"
+    targetStatus.TextColor3 = Color3.fromRGB(120, 200, 255)
+    targetStatus.Font = Enum.Font.Gotham
+    targetStatus.TextSize = 12
+    targetStatus.TextXAlignment = Enum.TextXAlignment.Left
+    targetStatus.Parent = content
+    
+    -- Mensaje de ayuda
+    local helpMessage = Instance.new("TextLabel")
+    helpMessage.Size = UDim2.new(0.85, 0, 0, 25)
+    helpMessage.Position = UDim2.new(0.075, 0, 0.36, 0)
+    helpMessage.BackgroundTransparency = 1
+    helpMessage.Text = "Presiona Enter para buscar"
+    helpMessage.TextColor3 = Color3.fromRGB(150, 150, 150)
+    helpMessage.Font = Enum.Font.Gotham
+    helpMessage.TextSize = 11
+    helpMessage.TextXAlignment = Enum.TextXAlignment.Left
+    helpMessage.TextWrapped = true
+    helpMessage.Parent = content
+    
+    -- Botón Fake Invis
+    local invisButton = Instance.new("TextButton")
+    invisButton.Size = UDim2.new(0.4, 0, 0, 30)
+    invisButton.Position = UDim2.new(0.075, 0, 0.45, 0)
+    invisButton.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    invisButton.Text = "Fake Invis: OFF (T)"
+    invisButton.TextColor3 = Color3.fromRGB(255, 80, 80)
+    invisButton.Font = Enum.Font.GothamBold
+    invisButton.TextSize = 14
+    invisButton.Parent = content
+    
+    local invisCorner = Instance.new("UICorner")
+    invisCorner.CornerRadius = UDim.new(0, 6)
+    invisCorner.Parent = invisButton
+    
+    local invisStroke = Instance.new("UIStroke")
+    invisStroke.Color = Color3.fromRGB(60, 60, 60)
+    invisStroke.Thickness = 1.5
+    invisStroke.Parent = invisButton
+    
+    -- Información adicional
+    local infoLabels = {
+        {text = "⚡ CARNAGE: Kill Aura 100 (H) + 150 (V) + ALTURA FIJA 35", y = 0.55, color = Color3.fromRGB(255, 100, 255)},
+        {text = "🛡️ ANTI-RAGDOLL PERMANENTE", y = 0.58, color = Color3.fromRGB(100, 255, 100)},
+        {text = "👻 Fake Invis: 6000 studs abajo (normal)", y = 0.61, color = Color3.fromRGB(255, 200, 100)},
+        {text = "🎯 PERSECUCIÓN: ALTURA FIJA 35 (cuando entra al ring)", y = 0.64, color = Color3.fromRGB(100, 200, 255)},
+        {text = "Teclas: Q=ESP | E=CARNAGE | T=Fake Invis", y = 0.68, color = Color3.fromRGB(200, 200, 100)}
+    }
+    
+    for _, info in ipairs(infoLabels) do
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(0.85, 0, 0, 25)
+        label.Position = UDim2.new(0.075, 0, info.y, 0)
+        label.BackgroundTransparency = 1
+        label.Text = info.text
+        label.TextColor3 = info.color
+        label.Font = Enum.Font.GothamBold
+        label.TextSize = 11
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.TextWrapped = true
+        label.Parent = content
+    end
+    
+    -- Separador
+    local separator = Instance.new("Frame")
+    separator.Size = UDim2.new(0.85, 0, 0, 1)
+    separator.Position = UDim2.new(0.075, 0, 0.52, 0)
+    separator.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+    separator.BorderSizePixel = 0
+    separator.Parent = content
+    
+    -- =============================================
+    -- FUNCIONES DE ACTUALIZACIÓN DE GUI
+    -- =============================================
+    
+    local function UpdateESPButton()
+        if ESP_Enabled then
+            espButton.Text = "ESP: ON"
+            espButton.TextColor3 = Color3.fromRGB(80, 255, 80)
+            espButton.BackgroundColor3 = Color3.fromRGB(40, 70, 40)
+            espStroke.Color = Color3.fromRGB(80, 150, 80)
+        else
+            espButton.Text = "ESP: OFF"
+            espButton.TextColor3 = Color3.fromRGB(255, 80, 80)
+            espButton.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+            espStroke.Color = Color3.fromRGB(60, 60, 60)
+        end
+    end
+    
+    local function UpdateCarnageButton()
+        if Carnage_Enabled then
+            carnageButton.Text = "CARNAGE: ON"
+            carnageButton.TextColor3 = Color3.fromRGB(80, 255, 80)
+            carnageButton.BackgroundColor3 = Color3.fromRGB(40, 70, 40)
+            carnageStroke.Color = Color3.fromRGB(80, 150, 80)
+        else
+            carnageButton.Text = "CARNAGE: OFF"
+            carnageButton.TextColor3 = Color3.fromRGB(255, 80, 80)
+            carnageButton.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+            carnageStroke.Color = Color3.fromRGB(60, 60, 60)
+        end
+    end
+    
+    local function UpdateInvisButton()
+        if FakeInvis_Active then
+            invisButton.Text = "Fake Invis: ON (T)"
+            invisButton.TextColor3 = Color3.fromRGB(80, 255, 80)
+            invisButton.BackgroundColor3 = Color3.fromRGB(40, 70, 40)
+            invisStroke.Color = Color3.fromRGB(80, 150, 80)
+        else
+            invisButton.Text = "Fake Invis: OFF (T)"
+            invisButton.TextColor3 = Color3.fromRGB(255, 80, 80)
+            invisButton.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+            invisStroke.Color = Color3.fromRGB(60, 60, 60)
+        end
+    end
+    
+    local function UpdateTargetStatus()
+        if TargetPlayer then
+            targetStatus.Text = "Objetivo actual: " .. TargetName
+            targetStatus.TextColor3 = Color3.fromRGB(80, 255, 80)
+            helpMessage.Text = "✓ Objetivo: " .. TargetName
+            helpMessage.TextColor3 = Color3.fromRGB(80, 255, 80)
+            targetBox.Text = TargetName
+        else
+            targetStatus.Text = "Objetivo actual: TODOS"
+            targetStatus.TextColor3 = Color3.fromRGB(120, 200, 255)
+        end
+    end
+    
+    -- =============================================
+    -- EVENTOS DE LA GUI
+    -- =============================================
+    
+    -- Botón ESP
+    espButton.MouseButton1Click:Connect(function()
+        ToggleESP()
+        UpdateESPButton()
+    end)
+    
+    -- Botón Carnage
+    carnageButton.MouseButton1Click:Connect(function()
+        ToggleCarnage()
+        UpdateCarnageButton()
+    end)
+    
+    -- Botón Fake Invis
+    invisButton.MouseButton1Click:Connect(function()
+        ToggleFakeInvis()
+        UpdateInvisButton()
+    end)
+    
+    -- Campo de texto para objetivo
+    targetBox.FocusLost:Connect(function(enterPressed)
+        if not enterPressed then return end
+        
+        local input = targetBox.Text
+        local result, name = FindPlayerByName(input)
+        
+        if result then
+            TargetPlayer = result
+            TargetName = name
+            UpdateTargetStatus()
+            helpMessage.Text = "✓ Encontrado: " .. name
+            helpMessage.TextColor3 = Color3.fromRGB(80, 255, 80)
+            
+            if Carnage_Enabled and IsInRing(TargetPlayer) and IsAlive(TargetPlayer) then
+                StartChase(TargetPlayer)
+            end
+        elseif result == nil then
+            TargetPlayer = nil
+            TargetName = "TODOS"
+            UpdateTargetStatus()
+            helpMessage.Text = "✓ Modo: TODOS"
+            helpMessage.TextColor3 = Color3.fromRGB(120, 200, 255)
+            
+            if Carnage_Enabled then
+                StopChase()
+            end
+        else
+            helpMessage.Text = name
+            helpMessage.TextColor3 = Color3.fromRGB(255, 80, 80)
+            
+            task.wait(3)
+            if helpMessage.Text:sub(1, 1) == "✓" or 
+               helpMessage.Text:find("no encontrado") or 
+               helpMessage.Text:find("Mínimo") then
+                helpMessage.Text = "Presiona Enter para buscar"
+                helpMessage.TextColor3 = Color3.fromRGB(150, 150, 150)
+            end
+        end
+    end)
+    
+    -- Limpiar texto del campo
+    targetBox:GetPropertyChangedSignal("Text"):Connect(function()
+        if targetBox.Text:gsub("%s+", "") == "" then
+            TargetPlayer = nil
+            TargetName = "TODOS"
+            UpdateTargetStatus()
+        end
+    end)
+    
+    -- =============================================
+    -- TECLAS RÁPIDAS
+    -- =============================================
+    
+    UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+        
+        if input.KeyCode == Enum.KeyCode.Q then
+            ToggleESP()
+            UpdateESPButton()
+        elseif input.KeyCode == Enum.KeyCode.E then
+            ToggleCarnage()
+            UpdateCarnageButton()
+        elseif input.KeyCode == Enum.KeyCode.T then
+            ToggleFakeInvis()
+            UpdateInvisButton()
+        end
+    end)
+    
+    -- =============================================
+    -- EVENTOS DE JUGADORES
+    -- =============================================
+    
+    -- Cuando un jugador se une
+    if PlayerAddedConnection then
+        PlayerAddedConnection:Disconnect()
+    end
+    
+    PlayerAddedConnection = Players.PlayerAdded:Connect(function(player)
+        if player == LocalPlayer then return end
+        
+        if ESP_Enabled then
+            CreateESPForPlayer(player)
+        end
+        
+        -- Actualizar objetivo si el campo está vacío
+        if targetBox.Text == "" and TargetPlayer == nil then
+            -- No hacer nada
+        end
+    end)
+    
+    -- Cuando un jugador se va
+    if PlayerRemovingConnection then
+        PlayerRemovingConnection:Disconnect()
+    end
+    
+    PlayerRemovingConnection = Players.PlayerRemoving:Connect(function(player)
+        if TargetPlayer == player then
+            TargetPlayer = nil
+            TargetName = "TODOS"
+            targetBox.Text = ""
+            UpdateTargetStatus()
+            helpMessage.Text = "⚠️ El objetivo salió"
+            helpMessage.TextColor3 = Color3.fromRGB(255, 150, 50)
+            
+            if Carnage_Enabled then
+                StopChase()
+            end
+        end
+        
+        if ESP_Enabled then
+            RemoveESPForPlayer(player)
+        end
+    end)
+    
+    -- Inicializar botones
+    UpdateESPButton()
+    UpdateCarnageButton()
+    UpdateInvisButton()
+    UpdateTargetStatus()
+    
+    return mainFrame
+end
+
+-- =============================================
+-- INICIALIZACIÓN
+-- =============================================
+
+print("=" .. string.rep("=", 50))
+print(" Diogo Br System - ANTI-RAGDOLL PERMANENTE")
+print("=" .. string.rep("=", 50))
+print("✅ Kill aura RANGO HORIZONTAL: 100 studs")
+print("✅ Kill aura RANGO VERTICAL: 150 studs")
+print("✅ PERSECUCIÓN: ALTURA FIJA 35")
+print("✅ Invisibilidad falsa NORMAL: 6000 studs abajo")
+print("✅ ANTI-RAGDOLL PERMANENTE")
+print("✅ Teclas: Q=ESP | E=CARNAGE | T=Fake Invis")
+print("=" .. string.rep("=", 50))
+
+-- Iniciar Anti-Ragdoll
+StartAntiRagdoll()
+
+-- Crear el ring
+CreateRing()
+
+-- Protección contra caída
+pcall(function()
+    Workspace.FallenPartsDestroyHeight = 0/0
+    print("✅ Protección anti-vacío activada")
+end)
+
+-- Crear GUI
+CreateFullGUI()
+
+print("✅ Sistema listo!")
+
+-- Mantener el script activo
+while true do
+    task.wait()
+end
